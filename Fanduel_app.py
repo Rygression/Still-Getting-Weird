@@ -17,7 +17,7 @@ ADAPTIVE_RATIO = 0.55  # N = round(ADAPTIVE_RATIO * weeks_played_so_far)
 
 # >>>>>>>>>>>>>>>>>>>>>
 # PLACEHOLDER DATA LOCATION — replace with your real path(s)
-DATA_DIR = "/Users/ryankamp/FanDuel Tracker"   # e.g., "/Users/you/Dropbox/DFSLeague"
+DATA_DIR = "~/Users/ryankamp/FanDuel Tracker"   # e.g., "/Users/you/Dropbox/DFSLeague"
 DATA_FILE = "league_scores.csv"              # your canonical file name
 # <<<<<<<<<<<<<<<<<<<<<
 

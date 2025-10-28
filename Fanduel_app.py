@@ -17,74 +17,79 @@ ADAPTIVE_RATIO = 0.55  # for Pace: K = round(ADAPTIVE_RATIO * weeks_count)
 WEEK_COL_RE = re.compile(r"^Week\s*(\d+)$", re.IGNORECASE)
 
 # ---------------------------
-# FIXED DATA PATH
+# Data Loading (GitHub Raw URL or local fallback)
 # ---------------------------
-DATA_PATH = "/Users/ryankamp/FanDuel_Tracker/league_scores.csv"
+GITHUB_CSV_URL = os.environ.get("LEAGUE_CSV_URL", "").strip()
+LOCAL_DEV_PATH = "/Users/ryankamp/FanDuel_Tracker/league_scores.csv"
+
+def load_csv_from_github() -> pd.DataFrame:
+    """
+    Loads league_scores.csv from GitHub (LEAGUE_CSV_URL) or local dev path.
+    Set LEAGUE_CSV_URL in Streamlit Cloud 'Secrets'.
+    """
+    # 1) Try GitHub first (production)
+    if GITHUB_CSV_URL:
+        try:
+            
+            return pd.read_csv(GITHUB_CSV_URL)
+        except Exception as e:
+            st.warning(f"Failed to load from GitHub: {e}")
+
+    # 2) Fallback to your Mac's local file
+    if os.path.exists(LOCAL_DEV_PATH):
+        try:
+            
+            return pd.read_csv(LOCAL_DEV_PATH, sep=None, engine="python")
+        except Exception as e:
+            st.error(f"Local data load failed: {e}")
+
+    st.error("Could not load league_scores.csv from GitHub or local path.")
+    st.stop()
+
+# Load the raw CSV
+raw = load_csv_from_github()
 
 # ---------------------------
-# Data Loading (Username-only, whitelist)
+# Data Transformation (Username-only, whitelist)
 # ---------------------------
 def is_wide_schema(df: pd.DataFrame) -> bool:
     return ("Username" in df.columns) and any(WEEK_COL_RE.match(str(c).strip()) for c in df.columns)
 
 def melt_wide_to_long(df_wide: pd.DataFrame, allowed_usernames: set) -> pd.DataFrame:
-    # Collect week columns
-    week_cols = []
-    for c in df_wide.columns:
-        m = WEEK_COL_RE.match(str(c).strip())
-        if m:
-            w = int(m.group(1))
-            if 1 <= w <= MAX_WEEKS:
-                week_cols.append(c)
+    week_cols = [c for c in df_wide.columns if WEEK_COL_RE.match(str(c).strip())]
     if not week_cols:
         raise ValueError("No 'Week N' columns found.")
 
-    # Keep only Username + week columns; ignore Name/Email/etc
-    if "Username" not in df_wide.columns:
-        raise ValueError("Expected 'Username' column in the CSV.")
-    keep = ["Username"] + week_cols
-    melted = df_wide[keep].melt(
+    melted = df_wide.melt(
         id_vars=["Username"],
         value_vars=week_cols,
         var_name="week_col",
         value_name="score"
     )
 
-    # Extract numeric week
     melted["week"] = melted["week_col"].str.extract(WEEK_COL_RE).astype(float).astype("Int64")
-    melted.drop(columns=["week_col"], inplace=True)
-
-    # Normalize fields
     melted["player"] = melted["Username"].astype(str).str.strip()
     melted["score"] = pd.to_numeric(melted["score"], errors="coerce")
 
-    # Strict whitelist
+    # Strict whitelist of known usernames from the sheet
     melted = melted[melted["player"].isin(allowed_usernames)]
     melted = melted.dropna(subset=["week"]).query("1 <= week <= @MAX_WEEKS")
-
     return melted[["week", "player", "score"]]
 
-def load_long_from_wide(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Data file not found at: {path}")
-    raw = pd.read_csv(path, sep=None, engine="python")
+def load_long_from_raw(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if not is_wide_schema(raw_df):
+        raise ValueError("CSV is not in expected wide format with 'Username' and 'Week N' columns.")
+    allowed_usernames = set(raw_df["Username"].astype(str).str.strip().dropna().unique().tolist())
+    return melt_wide_to_long(raw_df, allowed_usernames)
 
-    if not is_wide_schema(raw):
-        raise ValueError("CSV is not in the expected wide format with 'Username' and 'Week N' columns.")
-
-    # Authoritative whitelist of usernames
-    allowed_usernames = set(raw["Username"].astype(str).str.strip().dropna().unique().tolist())
-    return melt_wide_to_long(raw, allowed_usernames)
-
-# Load data
 try:
-    long_df = load_long_from_wide(DATA_PATH)
+    long_df = load_long_from_raw(raw)
 except Exception as e:
-    st.error(f"Problem loading data: {e}")
+    st.error(f"Problem processing data: {e}")
     st.stop()
 
 # ---------------------------
-# Sidebar Controls (after data load)
+# Sidebar Controls
 # ---------------------------
 all_players = sorted(long_df["player"].unique().tolist())
 weeks_present = sorted(long_df["week"].dropna().unique().tolist())
@@ -154,16 +159,16 @@ def compute_time_series(df: pd.DataFrame, mode_name: str, ratio: float):
     if weekly.empty:
         return weekly
 
-    # Week-by-week ranks
+    # Rank within week by mode_total
     weekly["rank"] = weekly.groupby("week")["mode_total"].rank(method="min", ascending=False).astype(int)
     weekly = weekly.sort_values(["player", "week"])
     weekly["prev_rank"] = weekly.groupby("player")["rank"].shift(1)
-    weekly["rank_delta"] = weekly["prev_rank"] - weekly["rank"]  # for reference
+    weekly["rank_delta"] = weekly["prev_rank"] - weekly["rank"]  # positive = improved vs previous week
     return weekly
 
 weekly = compute_time_series(long_df, mode, ADAPTIVE_RATIO)
 if weekly.empty:
-    st.warning("No data to compute yet. Check your source file or filters.")
+    st.warning("No data to compute yet.")
     st.stop()
 
 # ---------------------------
@@ -175,7 +180,7 @@ latest_week = int(weeks_in_view[-1])
 prev_week = int(weeks_in_view[-2]) if len(weeks_in_view) >= 2 else None
 
 # ---------------------------
-# Winnings helpers
+# Winnings helpers (no ties)
 # ---------------------------
 def compute_weekly_winnings(df_long: pd.DataFrame) -> pd.DataFrame:
     """
@@ -184,7 +189,7 @@ def compute_weekly_winnings(df_long: pd.DataFrame) -> pd.DataFrame:
     """
     win_amounts = {p: 0.0 for p in df_long["player"].unique()}
     for w, sub in df_long.groupby("week"):
-        sub = sub[["player", "score"]].dropna()
+        sub = sub.dropna(subset=["score"])
         if sub.empty:
             continue
         winner = sub.loc[sub["score"].idxmax(), "player"]
@@ -196,7 +201,7 @@ SEASON_PRIZES = {1: 450.0, 2: 270.0, 3: 180.0}
 
 def compute_onpace_payouts(df_long: pd.DataFrame, mode_name: str, ratio: float) -> pd.DataFrame:
     """
-    Season 'on-pace' winnings, no tie handling:
+    Season 'on-pace' winnings (no ties):
       - Total: K = 10
       - Pace:  K = round(0.55 * weeks_in_view)
     Ranking based on sum of best K weekly scores per player among weeks in view.
@@ -204,13 +209,9 @@ def compute_onpace_payouts(df_long: pd.DataFrame, mode_name: str, ratio: float) 
     weeks_in_view = sorted(df_long["week"].unique().tolist())
     weeks_count = len(weeks_in_view)
 
-    if mode_name == "Total":
-        K = 10
-    else:
-        K = int(round(ratio * weeks_count))
+    K = 10 if mode_name == "Total" else int(round(ratio * weeks_count))
     K = max(0, K)
 
-    # Aggregate best-K per player
     rows = []
     for p, sub in df_long.groupby("player"):
         s = sub["score"].dropna().values
@@ -230,13 +231,10 @@ def compute_onpace_payouts(df_long: pd.DataFrame, mode_name: str, ratio: float) 
 weekly_cash = compute_weekly_winnings(long_df)
 season_cash = compute_onpace_payouts(long_df, mode, ADAPTIVE_RATIO)
 
-winnings = (
-    pd.merge(weekly_cash, season_cash, on="player", how="outer")
-    .fillna(0.0)
-)
+winnings = pd.merge(weekly_cash, season_cash, on="player", how="outer").fillna(0.0)
 winnings["total_winnings"] = winnings["weekly_winnings"] + winnings["season_winnings"]
 
-# KPI 1: Highest single-week score + who/when
+# KPI 1: Highest single-week score (within filtered weeks)
 if not long_df.dropna(subset=["score"]).empty:
     idx = long_df["score"].idxmax()
     top_score = float(long_df.loc[idx, "score"])
@@ -252,10 +250,10 @@ k1, k2 = st.columns([1, 1])
 with k1:
     st.metric(label="Highest Single-Week Score", value=f"{top_score:.2f}", help=f"{top_player} in Week {top_week}")
 with k2:
-    st.metric(label="Players To Break Even", value=breakeven_count)
+    st.metric(label="Players to Break Even", value=breakeven_count)
 
 # Stacked bar chart (Weekly = green, Season = blue)
-st.markdown("### 💵 Cash Winnings (to date) — Weekly (green) + Season On-Pace (blue)")
+st.markdown("### 💵 Cash Winnings")
 
 bar_df = (
     winnings.melt(id_vars=["player"], value_vars=["weekly_winnings", "season_winnings"],
@@ -288,7 +286,7 @@ st.altair_chart(bar.interactive(), use_container_width=True)
 st.markdown("---")
 
 # ---------------------------
-# Compute explicit Δ from latest vs previous week (for standings)
+# Compute explicit Δ from latest vs previous week (for standings table)
 # ---------------------------
 latest_ranks = weekly.loc[weekly["week"] == latest_week, ["player", "rank"]].rename(columns={"rank": "curr_rank"})
 if prev_week is not None:
@@ -308,13 +306,13 @@ standings_base = (
     .assign(place=lambda d: range(1, len(d) + 1))
     [["place", "player", "mode_total"]]
 )
-
 standings_joined = standings_base.merge(rank_merge[["player", "delta"]], on="player", how="left")
 
 hdr1, hdr2 = st.columns([1, 1])
 with hdr1:
     st.metric("Mode", mode)
 with hdr2:
+    # Weeks label uses count in view for Total; pace count for Pace
     weeks_value = weeks_count if mode == "Total" else int(round(ADAPTIVE_RATIO * weeks_count))
     st.metric("Weeks", weeks_value)
 
@@ -350,6 +348,7 @@ def _style_delta(col: pd.Series):
 def _fmt_delta(v):
     return "" if pd.isna(v) else f"{int(v):+d}"
 
+# Non-scroll standings (hide index)
 row_height = 34
 header_pad = 64
 table_height = header_pad + max(10, len(standings_disp)) * row_height
@@ -383,7 +382,7 @@ line = (
                 title="Player",
                 orient="bottom",
                 direction="horizontal",
-                columns=5,
+                columns=5,              # wrap legend into rows
                 labelFontSize=11,
                 titleFontSize=12,
                 symbolSize=100,
@@ -397,7 +396,7 @@ line = (
                 "counted_weeks_so_far:Q",
                 title=("Counted (N)" if mode == "Pace" else "Weeks Played"),
             ),
-            alt.Tooltip("adaptive_N:Q", title="Adaptive N", format="d"),
+            alt.Tooltip("adaptive_N:Q", title="Adaptive N", format="d"),  # blank in Total mode
         ],
     )
     .properties(height=420)
@@ -446,7 +445,7 @@ rank_chart = (
                 title="Player",
                 orient="bottom",
                 direction="horizontal",
-                columns=5,
+                columns=5,              # wrap legend into rows
                 labelFontSize=11,
                 titleFontSize=12,
                 symbolSize=100,

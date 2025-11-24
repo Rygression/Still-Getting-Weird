@@ -261,11 +261,30 @@ bar_df = (
     .replace({"weekly_winnings": "Weekly", "season_winnings": "Season"})
 )
 
+# Stacked bar chart (Weekly = green, Season = blue)
+st.markdown("### 💵 Cash Winnings")
+
+bar_df = (
+    winnings.melt(id_vars=["player"], value_vars=["weekly_winnings", "season_winnings"],
+                  var_name="component", value_name="amount")
+    .replace({"weekly_winnings": "Weekly", "season_winnings": "Season"})
+)
+
+# --- compute total per player for sorting ---
+player_order = (
+    winnings.sort_values("total_winnings", ascending=False)["player"]
+    .tolist()
+)
+
 bar = (
     alt.Chart(bar_df)
     .mark_bar()
     .encode(
-        x=alt.X("player:N", title="Player", sort=sorted(winnings["player"].tolist())),
+        x=alt.X(
+            "player:N",
+            title="Player",
+            sort=player_order,  # ✅ sort by total winnings
+        ),
         y=alt.Y("amount:Q", title="Amount ($)", stack="zero"),
         color=alt.Color(
             "component:N",

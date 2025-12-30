@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 # -----------------------------
-# Load data (WIDE -> LONG)
+# Load data
 # -----------------------------
 DATA_URL = "https://raw.githubusercontent.com/Rygression/Still-Getting-Weird/refs/heads/main/league_scores.csv"
 
@@ -22,16 +22,13 @@ def load_data():
     wide = pd.read_csv(DATA_URL)
     wide.columns = wide.columns.str.strip()
 
-    # Rename fixed columns
     wide = wide.rename(columns={
         "Name": "player",
         "Username": "username"
     })
 
-    # Identify week columns
     week_cols = [c for c in wide.columns if re.match(r"Week \d+", c)]
 
-    # Melt to long format
     df = wide.melt(
         id_vars=["player", "username"],
         value_vars=week_cols,
@@ -39,18 +36,15 @@ def load_data():
         value_name="score"
     )
 
-    # Clean week + score
     df["week"] = df["week"].str.replace("Week ", "", regex=False).astype(int)
     df["score"] = pd.to_numeric(df["score"], errors="coerce")
 
-    # Remove zeros and nulls
     df = df.dropna(subset=["score"])
     df = df[df["score"] > 0]
 
     return df
 
 df = load_data()
-
 weeks_played = df["week"].nunique()
 
 # -----------------------------
@@ -64,16 +58,16 @@ else:
     K = max(1, round(weeks_played * 0.55))
 
 # -----------------------------
-# Core scoring logic
+# Core scoring logic (FIXED)
 # -----------------------------
 def calc_total(x, k):
     return x["score"].sort_values(ascending=False).head(k).sum()
 
 totals = (
-    df.groupby("player", as_index=False)
+    df.groupby("player")
       .apply(lambda x: calc_total(x, K))
-      .reset_index(drop=True)
-      .rename(columns={0: "total_score"})
+      .rename("total_score")
+      .reset_index()
 )
 
 totals["Rank"] = totals["total_score"].rank(
@@ -106,7 +100,7 @@ break_even = (weekly_winners >= 100).sum()
 col2.metric("Players Broken Even", break_even)
 
 # -----------------------------
-# Cash winnings (stacked bars)
+# Cash winnings chart
 # -----------------------------
 season_payouts = {1: 450, 2: 270, 3: 180}
 

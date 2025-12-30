@@ -1,315 +1,196 @@
-import streamlit as st
-import pandas as pd
-import altair as alt
-from io import StringIO
-import requests
+# Fanduel_app.py
 
-# -----------------------------
-# Page config
-# -----------------------------
+import re
+import numpy as np
+import pandas as pd
+import streamlit as st
+import altair as alt
+
+# ---------------------------
+# App Config
+# ---------------------------
 st.set_page_config(
-    page_title="FanDuel Friends League",
+    page_title="DFS Friends League Tracker",
     layout="wide"
 )
 
-# -----------------------------
-# Data loading (GitHub CSV)
-# -----------------------------
+st.title("🏈 Still Getting Weird Weekly Tracker")
+
+MAX_WEEKS = 18
+PACE_RATIO = 0.55
+WEEK_COL_RE = re.compile(r"^Week\s*(\d+)$", re.IGNORECASE)
+
+GITHUB_RAW_CSV = (
+    "https://raw.githubusercontent.com/Rygression/"
+    "Still-Getting-Weird/refs/heads/main/league_scores.csv"
+)
+
+# ---------------------------
+# Data Loading
+# ---------------------------
 @st.cache_data
-def load_data():
-    github_raw_url = "https://raw.githubusercontent.com/Rygression/Still-Getting-Weird/refs/heads/main/league_scores.csv"
-    
+def load_raw_csv():
+    return pd.read_csv(GITHUB_RAW_CSV)
 
-    response = requests.get(github_raw_url)
-    response.raise_for_status()
+raw = load_raw_csv()
 
-    df = pd.read_csv(StringIO(response.text))
-    return df
+# ---------------------------
+# Transform wide → long
+# ---------------------------
+week_cols = [c for c in raw.columns if WEEK_COL_RE.match(str(c))]
+if not week_cols:
+    st.error("No Week columns found in CSV.")
+    st.stop()
 
-
-df_raw = load_data()
-
-# -----------------------------
-# Clean + standardize
-# -----------------------------
-df = (
-    df_raw
-    .rename(columns={
-        "Player": "player",
-        "Week": "week",
-        "Score": "score"
-    })
+long_df = (
+    raw
+    .melt(
+        id_vars=["Username"],
+        value_vars=week_cols,
+        var_name="week_col",
+        value_name="score"
+    )
 )
 
-df = df.dropna(subset=["player", "week", "score"])
-df["week"] = df["week"].astype(int)
-df["score"] = df["score"].astype(float)
-
-players = sorted(df["player"].unique())
-weeks_played = df["week"].nunique()
-
-# -----------------------------
-# Mode toggle
-# -----------------------------
-mode = st.radio(
-    "Mode",
-    ["Total", "Pace"],
-    horizontal=True
+long_df["week"] = (
+    long_df["week_col"]
+    .str.extract(WEEK_COL_RE)
+    .astype(int)
 )
 
-# -----------------------------
-# Core computation
-# -----------------------------
-def compute_totals(scores_df, mode):
-    if mode == "Total":
-        K = 10
-    else:
-        K = int(round(weeks_played * 0.55))
+long_df["player"] = long_df["Username"].astype(str).str.strip()
+long_df["score"] = pd.to_numeric(long_df["score"], errors="coerce")
 
-    def top_k_sum(group):
-        return (
-            group.sort_values("score", ascending=False)
-                 .head(K)["score"]
-                 .sum()
-        )
+long_df = long_df.dropna(subset=["player", "week", "score"])
+long_df = long_df.query("1 <= week <= @MAX_WEEKS")
 
-    totals = (
-        scores_df
-        .groupby("player", group_keys=False)
-        .apply(top_k_sum)
-        .reset_index(name="total_score")
+# ---------------------------
+# Sidebar Controls
+# ---------------------------
+all_players = sorted(long_df["player"].unique())
+
+with st.sidebar:
+    st.header("Settings")
+    mode = st.radio("Scoring Mode", ["Total", "Pace"], index=1)
+
+    highlight_players = st.multiselect(
+        "Highlight players",
+        options=all_players
     )
 
-    return totals, K
-
-
-player_totals, K = compute_totals(df, mode)
-
-# -----------------------------
-# Weekly winner winnings
-# -----------------------------
-weekly_winners = (
-    df.loc[df.groupby("week")["score"].idxmax()]
-    .groupby("player")
-    .size()
-    .reset_index(name="weeks_won")
-)
-
-weekly_winners["weekly_winnings"] = weekly_winners["weeks_won"] * 50
-
-# -----------------------------
-# Standings
-# -----------------------------
-standings = (
-    player_totals
-    .merge(weekly_winners, on="player", how="left")
-    .fillna({"weekly_winnings": 0, "weeks_won": 0})
-    .sort_values("total_score", ascending=False)
-    .reset_index(drop=True)
-)
-
-standings["Rank"] = standings.index + 1
-
-# Previous week ranks
-def previous_week_ranks(scores_df, mode):
-    prev_weeks = sorted(scores_df["week"].unique())[:-1]
-    if not prev_weeks:
-        return pd.DataFrame(columns=["player", "prev_rank"])
-
-    prev_df = scores_df[scores_df["week"].isin(prev_weeks)]
-    prev_totals, _ = compute_totals(prev_df, mode)
-
-    prev_totals = (
-        prev_totals
-        .sort_values("total_score", ascending=False)
-        .reset_index(drop=True)
-    )
-    prev_totals["prev_rank"] = prev_totals.index + 1
-
-    return prev_totals[["player", "prev_rank"]]
-
-
-prev_ranks = previous_week_ranks(df, mode)
-
-standings = standings.merge(prev_ranks, on="player", how="left")
-
-standings["∆ Rank vs Previous"] = (
-    standings["prev_rank"] - standings["Rank"]
-)
-
-standings = standings.drop(columns=["prev_rank"])
-
-# -----------------------------
-# KPIs
-# -----------------------------
-max_score_row = df.loc[df["score"].idxmax()]
-highest_score = int(max_score_row["score"])
-highest_score_player = max_score_row["player"]
-
-break_even_players = standings[
-    standings["weekly_winnings"] >= 100
-].shape[0]
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.metric(
-        "Highest Single-Week Score",
-        f"{highest_score}",
-        highest_score_player
+    label_latest = st.toggle(
+        "Label latest points on line chart",
+        value=False
     )
 
-with col2:
-    st.metric(
-        "Players Who Broke Even",
-        break_even_players
-    )
-
-# -----------------------------
-# Stacked winnings chart
-# -----------------------------
-payouts = {1: 450, 2: 270, 3: 180}
-
-standings["season_payout"] = standings["Rank"].map(payouts).fillna(0)
-
-winnings_chart_df = standings.melt(
-    id_vars=["player"],
-    value_vars=["weekly_winnings", "season_payout"],
-    var_name="type",
-    value_name="amount"
-)
-
-winnings_chart = (
-    alt.Chart(winnings_chart_df)
-    .mark_bar()
-    .encode(
-        x=alt.X("player:N", sort="-y", title=None),
-        y=alt.Y("amount:Q", title="Winnings ($)"),
-        color=alt.Color(
-            "type:N",
-            scale=alt.Scale(
-                domain=["weekly_winnings", "season_payout"],
-                range=["#2ecc71", "#3498db"]
-            ),
-            title=None
-        ),
-        tooltip=["player", "type", "amount"]
-    )
-    .properties(height=300)
-)
-
-st.altair_chart(winnings_chart, use_container_width=True)
-
-# -----------------------------
-# Labels above standings
-# -----------------------------
-label_col1, label_col2 = st.columns(2)
-
-with label_col1:
-    st.markdown(f"**Mode:** {mode}")
-
-with label_col2:
-    st.markdown(f"**Weeks:** {K}")
-
-# -----------------------------
-# Standings table
-# -----------------------------
-styled = standings[[
-    "Rank",
-    "player",
-    "total_score",
-    "∆ Rank vs Previous",
-    "weekly_winnings"
-]].rename(columns={
-    "player": "Player",
-    "total_score": "Total",
-    "weekly_winnings": "Weekly Winnings ($)"
-})
-
-styled = styled.style.background_gradient(
-    subset=["∆ Rank vs Previous"],
-    cmap="RdYlGn"
-)
-
-st.dataframe(
-    styled,
-    hide_index=True,
-    use_container_width=True
-)
-
-# -----------------------------
-# Line chart: totals over time
-# -----------------------------
-def cumulative_scores(scores_df, mode):
-    weeks = sorted(scores_df["week"].unique())
+# ---------------------------
+# Core Computation
+# ---------------------------
+@st.cache_data
+def compute_weekly_totals(df, mode):
     rows = []
 
-    for w in weeks:
-        sub_df = scores_df[scores_df["week"] <= w]
-        totals, _ = compute_totals(sub_df, mode)
-        totals["week"] = w
-        rows.append(totals)
+    for week in sorted(df["week"].unique()):
+        up_to = df[df["week"] <= week]
 
-    return pd.concat(rows)
+        for player, sub in up_to.groupby("player"):
+            scores = sub["score"].values
+            weeks_played = len(scores)
 
+            if mode == "Total":
+                K = 10
+            else:
+                K = int(round(PACE_RATIO * weeks_played))
 
-cumulative_df = cumulative_scores(df, mode)
+            K = min(K, weeks_played)
+            total = np.sort(scores)[-K:].sum() if K > 0 else 0.0
 
-line_chart = (
-    alt.Chart(cumulative_df)
-    .mark_line(point=True, interpolate="monotone")
+            rows.append({
+                "week": week,
+                "player": player,
+                "total": total,
+                "weeks_used": K
+            })
+
+    out = pd.DataFrame(rows)
+
+    out["rank"] = (
+        out.groupby("week")["total"]
+        .rank(ascending=False, method="min")
+        .astype(int)
+    )
+
+    out = out.sort_values(["player", "week"])
+    out["prev_rank"] = out.groupby("player")["rank"].shift(1)
+    out["rank_delta"] = out["prev_rank"] - out["rank"]
+
+    return out
+
+weekly = compute_weekly_totals(long_df, mode)
+
+latest_week = weekly["week"].max()
+
+# ---------------------------
+# KPIs
+# ---------------------------
+idx = long_df["score"].idxmax()
+top_score = long_df.loc[idx, "score"]
+top_player = long_df.loc[idx, "player"]
+top_week = long_df.loc[idx, "week"]
+
+weekly_wins = (
+    long_df
+    .loc[long_df.groupby("week")["score"].idxmax()]
+    .groupby("player")
+    .size()
+    .mul(50)
+)
+
+breakeven_count = int((weekly_wins >= 100).sum())
+
+k1, k2 = st.columns(2)
+k1.metric(
+    "Highest Single-Week Score",
+    f"{top_score:.2f}",
+    help=f"{top_player} — Week {top_week}"
+)
+k2.metric(
+    "Players Who Have Broken Even",
+    breakeven_count
+)
+
+# ---------------------------
+# Line Chart: Total / Pace
+# ---------------------------
+st.markdown("### 📈 Player Totals Over Time")
+
+line = (
+    alt.Chart(weekly)
+    .mark_line(point=True)
     .encode(
         x=alt.X("week:O", title="Week"),
-        y=alt.Y("total_score:Q", title="Total"),
+        y=alt.Y("total:Q", title="Total"),
         color=alt.Color(
             "player:N",
             legend=alt.Legend(
                 orient="bottom",
-                columns=4
+                direction="horizontal",
+                columns=5
             )
         ),
-        tooltip=["player", "week", "total_score"]
+        tooltip=[
+            "player",
+            "week",
+            alt.Tooltip("total:Q", format=".2f"),
+            alt.Tooltip("weeks_used:Q", title="Weeks Counted")
+        ]
     )
-    .properties(height=400)
+    .properties(height=420)
 )
 
-st.altair_chart(line_chart, use_container_width=True)
-
-# -----------------------------
-# Rank by week chart
-# -----------------------------
-rank_rows = []
-
-for w in sorted(df["week"].unique()):
-    sub_df = df[df["week"] <= w]
-    totals, _ = compute_totals(sub_df, mode)
-    totals = totals.sort_values("total_score", ascending=False)
-    totals["rank"] = range(1, len(totals) + 1)
-    totals["week"] = w
-    rank_rows.append(totals)
-
-rank_df = pd.concat(rank_rows)
-
-rank_chart = (
-    alt.Chart(rank_df)
-    .mark_line(point=True, interpolate="monotone")
-    .encode(
-        x=alt.X("week:O", title="Week"),
-        y=alt.Y(
-            "rank:Q",
-            scale=alt.Scale(reverse=True),
-            title="Rank"
-        ),
-        color=alt.Color(
-            "player:N",
-            legend=alt.Legend(
-                orient="bottom",
-                columns=4
-            )
-        ),
-        tooltip=["player", "week", "rank"]
-    )
-    .properties(height=400)
-)
-
-st.altair_chart(rank_chart, use_container_width=True)
+if highlight_players:
+    line = line.encode(
+        opacity=alt.condition(
+            alt.FieldOneOfPredicate("player", highlight_players),
+            alt.value(1),
+            alt.val

@@ -43,9 +43,6 @@ def load_data():
     df["week"] = df["week"].str.replace("Week ", "", regex=False).astype(int)
     df["score"] = pd.to_numeric(df["score"], errors="coerce")
 
-    # Remove zeros and nulls
-    df = df.dropna(subset=["score"])
-    df = df[df["score"] > 0]
 
     return df
 
